@@ -1,0 +1,170 @@
+import os
+os.environ["WANDB_DISABLED"] = "true"
+
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
+import numpy as np
+import optuna
+
+# Load dataset
+dataset = load_dataset("SetFit/sst5")
+train_val = dataset['train']
+test_dataset = dataset['test']
+train_test_split = train_val.train_test_split(test_size=0.176, seed=42)
+train_dataset = train_test_split['train']
+val_dataset = train_test_split['test']
+
+model_name = "microsoft/deberta-v3-base"
+
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    preds = np.argmax(predictions, axis=1)
+    accuracy = accuracy_score(labels, preds)
+    return {'accuracy': accuracy}
+
+def objective(trial):
+    """Optuna objective function"""
+    
+    # Suggest hyperparameters
+    learning_rate = trial.suggest_float('learning_rate', 5e-6, 2e-5, log=True)
+    num_epochs = trial.suggest_int('num_epochs', 5, 8)
+    batch_size = trial.suggest_categorical('batch_size', [8, 16, 32])
+    weight_decay = trial.suggest_float('weight_decay', 0.001, 0.1, log=True)
+    warmup_ratio = trial.suggest_float('warmup_ratio', 0.06, 0.15)
+    
+    # Load model
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=5)
+    
+    # Tokenize
+    def tokenize_function(examples):
+        return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=128)
+    
+    train_data = train_dataset.map(tokenize_function, batched=True)
+    val_data = val_dataset.map(tokenize_function, batched=True)
+    
+    # Training
+    training_args = TrainingArguments(
+        output_dir=f"./optuna_trial_{trial.number}",
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=batch_size,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        warmup_ratio=warmup_ratio,
+        eval_strategy="epoch",
+        save_strategy="no",  # Don't save to save space
+        logging_steps=100,
+        seed=42,
+    )
+    
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_data,
+        eval_dataset=val_data,
+        compute_metrics=compute_metrics,
+    )
+    
+    trainer.train()
+    
+    # Return validation accuracy
+    eval_result = trainer.evaluate(val_data)
+    return eval_result['eval_accuracy']
+
+# Run optimization
+print("Starting Optuna hyperparameter search...")
+print("This will run 20 trials to find optimal parameters.\n")
+
+study = optuna.create_study(direction='maximize')
+study.optimize(objective, n_trials=20)
+
+# Print results
+print("\n" + "="*60)
+print("OPTUNA RESULTS")
+print("="*60)
+print(f"\nBest validation accuracy: {study.best_value:.4f} ({study.best_value*100:.2f}%)")
+print(f"\nBest hyperparameters:")
+for key, value in study.best_params.items():
+    print(f"  {key}: {value}")
+
+# Train final model with best parameters
+print("\n" + "="*60)
+print("Training final model with best parameters...")
+print("="*60)
+
+best_params = study.best_params
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=5)
+
+def tokenize_function(examples):
+    return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=128)
+
+train_data = train_dataset.map(tokenize_function, batched=True)
+val_data = val_dataset.map(tokenize_function, batched=True)
+test_data = test_dataset.map(tokenize_function, batched=True)
+
+training_args = TrainingArguments(
+    output_dir="./deberta_optuna_best",
+    num_train_epochs=best_params['num_epochs'],
+    per_device_train_batch_size=best_params['batch_size'],  # Use optimized batch size
+    learning_rate=best_params['learning_rate'],
+    weight_decay=best_params['weight_decay'],
+    warmup_ratio=best_params['warmup_ratio'],
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    metric_for_best_model="accuracy",
+    seed=42,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_data,
+    eval_dataset=val_data,
+    compute_metrics=compute_metrics,
+)
+
+trainer.train()
+
+# Evaluate on test set
+print("\n" + "="*60)
+print("TEST SET EVALUATION")
+print("="*60)
+
+predictions = trainer.predict(test_data)
+preds = np.argmax(predictions.predictions, axis=1)
+labels = predictions.label_ids
+
+accuracy = accuracy_score(labels, preds)
+macro_f1 = f1_score(labels, preds, average='macro')
+weighted_f1 = f1_score(labels, preds, average='weighted')
+
+print(f"\nTest Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+print(f"Macro F1: {macro_f1:.4f}")
+print(f"Weighted F1: {weighted_f1:.4f}")
+
+# Classification report
+class_names = ['very negative', 'negative', 'neutral', 'positive', 'very positive']
+report = classification_report(labels, preds, target_names=class_names)
+print("\n" + "="*60)
+print("CLASSIFICATION REPORT")
+print("="*60)
+print(report)
+
+# Confusion matrix
+cm = confusion_matrix(labels, preds)
+print("\n" + "="*60)
+print("CONFUSION MATRIX")
+print("="*60)
+print("Rows = True labels, Columns = Predicted labels")
+print(cm)
+
+# Save model
+trainer.save_model("./sst5_deberta_model")
+tokenizer.save_pretrained("./sst5_deberta_model")
+print("\n" + "="*60)
+print("Model saved to ./sst5_deberta_model")
+print("="*60)
