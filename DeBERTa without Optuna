@@ -1,0 +1,112 @@
+import os
+os.environ["WANDB_DISABLED"] = "true"
+
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, accuracy_score
+import numpy as np
+
+# 1. Load dataset
+dataset = load_dataset("SetFit/sst5")
+
+train_val = dataset['train']
+test_dataset = dataset['test']
+
+train_test_split = train_val.train_test_split(test_size=0.176, seed=42)
+train_dataset = train_test_split['train']
+val_dataset = train_test_split['test']
+
+print(f"Train size: {len(train_dataset)}")
+print(f"Validation size: {len(val_dataset)}")
+print(f"Test size: {len(test_dataset)}")
+
+# 2. Use DeBERTa-v3-base (no authentication needed)
+model_name = "microsoft/deberta-v3-base"  # This should work without issues
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSequenceClassification.from_pretrained(
+    model_name,
+    num_labels=5
+)
+
+# 3. Tokenize
+def tokenize_function(examples):
+    return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=128)
+
+train_dataset = train_dataset.map(tokenize_function, batched=True)
+val_dataset = val_dataset.map(tokenize_function, batched=True)
+test_dataset = test_dataset.map(tokenize_function, batched=True)
+
+# 4. Metrics
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    preds = np.argmax(predictions, axis=1)
+
+    accuracy = accuracy_score(labels, preds)
+    macro_f1 = f1_score(labels, preds, average='macro')
+    weighted_f1 = f1_score(labels, preds, average='weighted')
+
+    return {
+        'accuracy': accuracy,
+        'macro_f1': macro_f1,
+        'weighted_f1': weighted_f1
+    }
+
+# 5. Training arguments
+training_args = TrainingArguments(
+    output_dir="./sst5_deberta_results",
+    num_train_epochs=6,
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=32,
+    learning_rate=1e-5,
+    weight_decay=0.01,
+    warmup_ratio=0.1,
+    lr_scheduler_type="cosine",
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    metric_for_best_model="accuracy",
+    logging_dir='./logs',
+    logging_steps=50,
+    seed=42,
+    fp16=True,
+)
+
+# 6. Train
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    compute_metrics=compute_metrics,
+)
+
+print("\n=== Training DeBERTa-v3-base ===")
+trainer.train()
+
+# 7. Evaluate
+print("\n=== Test Set Evaluation ===")
+predictions = trainer.predict(test_dataset)
+preds = np.argmax(predictions.predictions, axis=1)
+labels = predictions.label_ids
+
+accuracy = accuracy_score(labels, preds)
+macro_f1 = f1_score(labels, preds, average='macro')
+weighted_f1 = f1_score(labels, preds, average='weighted')
+
+print(f"\nAccuracy: {accuracy:.4f}")
+print(f"Macro F1: {macro_f1:.4f}")
+print(f"Weighted F1: {weighted_f1:.4f}")
+
+class_names = ['very negative', 'negative', 'neutral', 'positive', 'very positive']
+report = classification_report(labels, preds, target_names=class_names)
+print("\n=== Classification Report ===")
+print(report)
+
+cm = confusion_matrix(labels, preds)
+print("\n=== Confusion Matrix ===")
+print(cm)
+
+trainer.save_model("./sst5_deberta_model")
+tokenizer.save_pretrained("./sst5_deberta_model")
+print("\nModel saved!")
