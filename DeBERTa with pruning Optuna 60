@@ -1,0 +1,213 @@
+import os
+os.environ["WANDB_DISABLED"] = "true"
+
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, TrainerCallback
+from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
+import numpy as np
+import optuna
+from optuna.pruners import SuccessiveHalvingPruner
+
+# Load dataset
+dataset = load_dataset("SetFit/sst5")
+train_val = dataset['train']
+test_dataset = dataset['test']
+train_test_split = train_val.train_test_split(test_size=0.176, seed=42)
+train_dataset = train_test_split['train']
+val_dataset = train_test_split['test']
+
+model_name = "microsoft/deberta-v3-base"
+
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    preds = np.argmax(predictions, axis=1)
+    accuracy = accuracy_score(labels, preds)
+    return {'accuracy': accuracy}
+
+# Custom callback to report to Optuna and handle pruning
+class OptunaReportCallback(TrainerCallback):
+    def __init__(self, trial):
+        self.trial = trial
+    
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        """Report intermediate accuracy to Optuna after each evaluation"""
+        if metrics is not None and 'eval_accuracy' in metrics:
+            # Report the accuracy at current epoch
+            self.trial.report(metrics['eval_accuracy'], state.epoch)
+            
+            # Check if trial should be pruned
+            if self.trial.should_prune():
+                raise optuna.TrialPruned()
+
+def objective(trial):
+    """Optuna objective function with pruning support"""
+    
+    # Narrowed search space based on your findings
+    learning_rate = trial.suggest_float('learning_rate', 5e-6, 2e-5, log=True)
+    num_epochs = trial.suggest_int('num_epochs', 5, 8)
+    batch_size = 16  # Fixed since both converged to 16
+    weight_decay = trial.suggest_float('weight_decay', 0.001, 0.1, log=True)
+    warmup_ratio = trial.suggest_float('warmup_ratio', 0.06, 0.15)
+    lr_scheduler_type = "cosine"  # Fixed since both used cosine
+
+    # Load model
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=5)
+    
+    # Tokenize
+    def tokenize_function(examples):
+        return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=128)
+    
+    train_data = train_dataset.map(tokenize_function, batched=True)
+    val_data = val_dataset.map(tokenize_function, batched=True)
+    
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir=f"./optuna_trial_{trial.number}",
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=batch_size,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        warmup_ratio=warmup_ratio,
+        lr_scheduler_type=lr_scheduler_type,
+        eval_strategy="epoch",  # Evaluate every epoch for pruning
+        save_strategy="no",  # Don't save to save space
+        logging_steps=100,
+        seed=42,
+        fp16=True,  # Enable mixed precision for faster training
+    )
+    
+    # Create trainer with Optuna callback
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_data,
+        eval_dataset=val_data,
+        compute_metrics=compute_metrics,
+        callbacks=[OptunaReportCallback(trial)],  # Add callback for pruning
+    )
+    
+    # Train (will be pruned if performing poorly)
+    trainer.train()
+    
+    # Return final validation accuracy
+    eval_result = trainer.evaluate(val_data)
+    return eval_result['eval_accuracy']
+
+# Run optimization with pruning
+print("Starting Optuna hyperparameter search with pruning...")
+print("This will run up to 60 trials with early stopping for poor configurations.\n")
+
+# Create study with Successive Halving Pruner
+study = optuna.create_study(
+    direction='maximize',
+    pruner=SuccessiveHalvingPruner(
+        min_resource=1,              # Start pruning after 1 epoch
+        reduction_factor=4,          # Keep top 1/4 at each stage
+        min_early_stopping_rate=0    # Can prune immediately
+    )
+)
+
+study.optimize(objective, n_trials=60)
+
+# Print results
+print("\n" + "="*60)
+print("OPTUNA RESULTS")
+print("="*60)
+print(f"\nBest validation accuracy: {study.best_value:.4f} ({study.best_value*100:.2f}%)")
+print(f"\nBest hyperparameters:")
+for key, value in study.best_params.items():
+    print(f"  {key}: {value}")
+
+# Print pruning statistics
+pruned_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
+complete_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+print(f"\nPruning Statistics:")
+print(f"  Total trials: {len(study.trials)}")
+print(f"  Completed trials: {len(complete_trials)}")
+print(f"  Pruned trials: {len(pruned_trials)}")
+print(f"  Pruning rate: {len(pruned_trials)/len(study.trials)*100:.1f}%")
+
+# Train final model with best parameters
+print("\n" + "="*60)
+print("Training final model with best parameters...")
+print("="*60)
+
+best_params = study.best_params
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=5)
+
+def tokenize_function(examples):
+    return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=128)
+
+train_data = train_dataset.map(tokenize_function, batched=True)
+val_data = val_dataset.map(tokenize_function, batched=True)
+test_data = test_dataset.map(tokenize_function, batched=True)
+
+training_args = TrainingArguments(
+    output_dir="./deberta_optuna_best",
+    num_train_epochs=best_params['num_epochs'],
+    per_device_train_batch_size= 16,  # Using fixed batch_size=16
+    learning_rate=best_params['learning_rate'],
+    weight_decay=best_params['weight_decay'],
+    warmup_ratio=best_params['warmup_ratio'],
+    lr_scheduler_type='cosine',
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    metric_for_best_model="accuracy",
+    seed=42,
+    fp16=True,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_data,
+    eval_dataset=val_data,
+    compute_metrics=compute_metrics,
+)
+
+trainer.train()
+
+# Evaluate on test set
+print("\n" + "="*60)
+print("TEST SET EVALUATION")
+print("="*60)
+
+test_data = test_dataset.map(tokenize_function, batched=True)
+predictions = trainer.predict(test_data)
+preds = np.argmax(predictions.predictions, axis=1)
+labels = predictions.label_ids
+
+accuracy = accuracy_score(labels, preds)
+macro_f1 = f1_score(labels, preds, average='macro')
+weighted_f1 = f1_score(labels, preds, average='weighted')
+
+print(f"\nTest Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+print(f"Macro F1: {macro_f1:.4f}")
+print(f"Weighted F1: {weighted_f1:.4f}")
+
+# Classification report
+class_names = ['very negative', 'negative', 'neutral', 'positive', 'very positive']
+report = classification_report(labels, preds, target_names=class_names)
+print("\n" + "="*60)
+print("CLASSIFICATION REPORT")
+print("="*60)
+print(report)
+
+# Confusion matrix
+cm = confusion_matrix(labels, preds)
+print("\n" + "="*60)
+print("CONFUSION MATRIX")
+print("="*60)
+print("Rows = True labels, Columns = Predicted labels")
+print(cm)
+
+# Save model
+trainer.save_model("./sst5_deberta_model")
+tokenizer.save_pretrained("./sst5_deberta_model")
+print("\n" + "="*60)
+print("Model saved to ./sst5_deberta_model")
+print("="*60)
