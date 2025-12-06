@@ -25,25 +25,25 @@ def compute_metrics(eval_pred):
 
 def objective(trial):
     """Optuna objective function"""
-    
+
     # Suggest hyperparameters
     learning_rate = trial.suggest_float('learning_rate', 5e-6, 2e-5, log=True)
     num_epochs = trial.suggest_int('num_epochs', 5, 8)
     batch_size = trial.suggest_categorical('batch_size', [8, 16, 32])
     weight_decay = trial.suggest_float('weight_decay', 0.001, 0.1, log=True)
     warmup_ratio = trial.suggest_float('warmup_ratio', 0.06, 0.15)
-    
+
     # Load model
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=5)
-    
+
     # Tokenize
     def tokenize_function(examples):
         return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=128)
-    
+
     train_data = train_dataset.map(tokenize_function, batched=True)
     val_data = val_dataset.map(tokenize_function, batched=True)
-    
+
     # Training
     training_args = TrainingArguments(
         output_dir=f"./optuna_trial_{trial.number}",
@@ -56,8 +56,10 @@ def objective(trial):
         save_strategy="no",  # Don't save to save space
         logging_steps=100,
         seed=42,
+        lr_scheduler_type='cosine',
+        fp16=True,
     )
-    
+
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -65,9 +67,9 @@ def objective(trial):
         eval_dataset=val_data,
         compute_metrics=compute_metrics,
     )
-    
+
     trainer.train()
-    
+
     # Return validation accuracy
     eval_result = trainer.evaluate(val_data)
     return eval_result['eval_accuracy']
@@ -117,6 +119,8 @@ training_args = TrainingArguments(
     load_best_model_at_end=True,
     metric_for_best_model="accuracy",
     seed=42,
+    lr_scheduler_type='cosine',
+    fp16=True,
 )
 
 trainer = Trainer(
