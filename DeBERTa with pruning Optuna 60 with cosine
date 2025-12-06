@@ -33,7 +33,7 @@ class OptunaReportCallback(TrainerCallback):
         """Report intermediate accuracy to Optuna after each evaluation"""
         if metrics is not None and 'eval_accuracy' in metrics:
             # Report the accuracy at current epoch
-            self.trial.report(metrics['eval_accuracy'], state.epoch)
+            self.trial.report(metrics['eval_accuracy'], int(state.epoch))
             
             # Check if trial should be pruned
             if self.trial.should_prune():
@@ -45,7 +45,7 @@ def objective(trial):
     # Narrowed search space based on your findings
     learning_rate = trial.suggest_float('learning_rate', 5e-6, 2e-5, log=True)
     num_epochs = trial.suggest_int('num_epochs', 5, 8)
-    batch_size = 16  # Fixed since both converged to 16
+    batch_size = trial.suggest_categorical('batch_size', [8, 16, 32])
     weight_decay = trial.suggest_float('weight_decay', 0.001, 0.1, log=True)
     warmup_ratio = trial.suggest_float('warmup_ratio', 0.06, 0.15)
     lr_scheduler_type = "cosine"  # Fixed since both used cosine
@@ -148,7 +148,7 @@ test_data = test_dataset.map(tokenize_function, batched=True)
 training_args = TrainingArguments(
     output_dir="./deberta_optuna_best",
     num_train_epochs=best_params['num_epochs'],
-    per_device_train_batch_size= 16,  # Using fixed batch_size=16
+    per_device_train_batch_size=best_params['batch_size'],  # Use optimized batch size
     learning_rate=best_params['learning_rate'],
     weight_decay=best_params['weight_decay'],
     warmup_ratio=best_params['warmup_ratio'],
@@ -176,8 +176,7 @@ print("\n" + "="*60)
 print("TEST SET EVALUATION")
 print("="*60)
 
-test_data = test_dataset.map(tokenize_function, batched=True)
-predictions = trainer.predict(test_data)
+predictions = trainer.predict(test_data)  # test_data already tokenized above
 preds = np.argmax(predictions.predictions, axis=1)
 labels = predictions.label_ids
 
